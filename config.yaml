@@ -1,0 +1,25 @@
+# Project configuration file
+data:
+  raw_path: "data/raw/fake_job_postings.csv"
+  processed_path: "data/processed/"
+  train_size: 0.7
+  val_size: 0.15
+  test_size: 0.15
+  random_state: 42
+
+model:
+  text_seq_length: 200
+  embedding_dim: 100
+  lstm_units: 64
+  dense_units: 32
+  dropout_rate: 0.3
+  batch_size: 32
+  epochs: 10
+
+training:
+  learning_rate: 0.001
+  early_stopping_patience: 5
+
+paths:
+  models: "models/"
+  embeddings: "data/embeddings/"
