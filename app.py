@@ -11,27 +11,21 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import time
 import random
-from urllib.parse import quote, urlparse, urljoin
+from urllib.parse import quote, urlparse, urljoin, parse_qs
 import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# DEEP LEARNING IMPORTS
-import tensorflow as tf 
-from tensorflow.keras.models import Sequential, Model, load_model
-from tensorflow.keras.layers import (Dense, LSTM, GRU, Bidirectional, Embedding, 
-                                   Dropout, Conv1D, GlobalMaxPooling1D, GlobalAveragePooling1D,
-                                   MultiHeadAttention, LayerNormalization, Input, Concatenate)
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.preprocessing.text import Tokenizer
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.utils import to_categorical
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.utils.class_weight import compute_class_weight
 import warnings
 warnings.filterwarnings('ignore')
+
+# Common user agents for basic rotation (helps with some blocking)
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+]
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -47,12 +41,17 @@ ML_THRESHOLD = 0.4
 def load_fraud_model_assets():
     if not (os.path.exists(MODEL_PATH) and os.path.exists(TOKENIZER_PATH)):
         return None, None
-    model = load_model(MODEL_PATH)
+    try:
+        from tensorflow.keras.models import load_model
+    except Exception:
+        return None, None
     tokenizer = joblib.load(TOKENIZER_PATH)
+    model = load_model(MODEL_PATH)
     return model, tokenizer
 
 
 def predict_fraud_score(model, tokenizer, title, description):
+    from tensorflow.keras.preprocessing.sequence import pad_sequences
     combined_text = f"{title} {description}"
     seq = tokenizer.texts_to_sequences([combined_text])
     padded = pad_sequences(seq, maxlen=MAX_TEXT_LEN, padding='post', truncating='post')
@@ -61,10 +60,325 @@ def predict_fraud_score(model, tokenizer, title, description):
     prob = float(model.predict([padded, numeric_features], verbose=0)[0][0])
     return prob
 
+def _normalize_match_text(s):
+    return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
+
+def _domain_matches(candidate, allowed_domains):
+    cand = (candidate or '').lower().lstrip('www.')
+    for d in allowed_domains:
+        base = (d or '').lower().lstrip('www.')
+        if not base:
+            continue
+        if cand == base or cand.endswith('.' + base):
+            return True
+    return False
+
+def verify_job_url(job_url, job_title, allowed_domains):
+    """Verify a specific job posting URL on official domains."""
+    if not job_url:
+        return {"status": "inconclusive", "reason": "No job URL provided"}
+
+    url = job_url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    try:
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return {"status": "blocked", "reason": "Invalid job URL"}
+        if not _domain_matches(parsed.netloc, allowed_domains):
+            return {"status": "blocked", "reason": "Job URL domain does not match official career domains"}
+
+        # URL-level verification (works even if page is JS-heavy)
+        q = parse_qs(parsed.query)
+        title_q = q.get("title", [""])[0]
+        id_q = q.get("id", [""])[0]
+        job_title_norm = _normalize_match_text(job_title)
+        if title_q and _normalize_match_text(title_q) == job_title_norm:
+            return {"status": "verified", "reason": "Title matched in URL parameters"}
+        if job_title_norm and job_title_norm in _normalize_match_text(url):
+            return {"status": "verified", "reason": "Title matched in URL"}
+        # Accenture-style jobdetails URL with id parameter
+        if "jobdetails" in parsed.path.lower() and id_q:
+            return {"status": "verified", "reason": "Official jobdetails URL with id parameter"}
+
+        resp = requests.get(url, timeout=12, verify=False, proxies=get_active_proxies())
+        if resp.status_code != 200:
+            return {"status": "inconclusive", "reason": f"HTTP {resp.status_code}"}
+
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        text = resp.text or ""
+        if "application/json" in content_type:
+            try:
+                data = resp.json()
+                blob = json.dumps(data).lower()
+                if _normalize_match_text(job_title) in _normalize_match_text(blob):
+                    return {"status": "verified", "reason": "Title matched in JSON response"}
+            except Exception:
+                pass
+
+        if len(text) < 2000 or "enable javascript" in text.lower():
+            return {"status": "inconclusive", "reason": "Page appears JS-heavy; cannot verify server-side"}
+
+        if _normalize_match_text(job_title) in _normalize_match_text(text):
+            return {"status": "verified", "reason": "Title matched in page content"}
+
+        return {"status": "inconclusive", "reason": "Title not found on job page"}
+    except Exception as e:
+        return {"status": "inconclusive", "reason": str(e)}
+
+def _extract_first_url(text):
+    if not text:
+        return ""
+    # Basic URL extraction
+    m = re.search(r'(https?://[^\s)]+)', text)
+    return m.group(1) if m else ""
+
+def _extract_accenture_job_id(text):
+    if not text:
+        return ""
+    # Match IDs like ATCI-5483975-S2003396 or ATCI-5483975-S2003396_en
+    m = re.search(r'\bATCI-\d+-S\d+(?:_en)?\b', text)
+    return m.group(0) if m else ""
+
+def get_active_proxies():
+    """Return proxies dict from Streamlit session state, if configured."""
+    try:
+        if st.session_state.get("use_proxy"):
+            proxies = {}
+            http_p = st.session_state.get("proxy_http", "").strip()
+            https_p = st.session_state.get("proxy_https", "").strip()
+            if http_p:
+                proxies["http"] = http_p
+            if https_p:
+                proxies["https"] = https_p
+            return proxies or None
+    except Exception:
+        pass
+    return None
+
+def _extract_email_domains(text):
+    if not text:
+        return []
+    emails = re.findall(r'[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})', text)
+    return list({e.lower().lstrip('www.') for e in emails})
+
+def _extract_urls(text):
+    if not text:
+        return []
+    return re.findall(r'https?://[^\s)]+', text)
+
+def _normalize_domain(d):
+    return (d or '').lower().lstrip('www.')
+
+def _domain_in_list(domain, allowed):
+    domain = _normalize_domain(domain)
+    for a in allowed:
+        base = _normalize_domain(a)
+        if not base:
+            continue
+        if domain == base or domain.endswith('.' + base):
+            return True
+    return False
+
+ATS_PROVIDERS = [
+    "myworkdayjobs.com",
+    "workday.com",
+    "greenhouse.io",
+    "lever.co",
+    "icims.com",
+    "oraclecloud.com",
+    "taleo.net",
+    "successfactors.com",
+]
+
+def verify_ats_url(job_url, company_name):
+    """Check if URL belongs to a common ATS provider and contains company hints."""
+    if not job_url:
+        return {"status": "inconclusive", "reason": "No URL provided"}
+    try:
+        parsed = urlparse(job_url)
+        host = _normalize_domain(parsed.netloc)
+        if not host:
+            return {"status": "blocked", "reason": "Invalid URL"}
+        if not _domain_in_list(host, ATS_PROVIDERS):
+            return {"status": "inconclusive", "reason": "Not an ATS provider domain"}
+        # Try to see company name in path or query
+        company_norm = _normalize_match_text(company_name)
+        url_norm = _normalize_match_text(job_url)
+        if company_norm and company_norm in url_norm:
+            return {"status": "verified", "reason": "ATS URL contains company name"}
+        return {"status": "inconclusive", "reason": "ATS URL detected; company not verified in URL"}
+    except Exception as e:
+        return {"status": "inconclusive", "reason": str(e)}
+
+def build_verification_checklist(company_result, job_url, job_title, job_description):
+    items = []
+    # Official domain / URL checks
+    allowed_domains = []
+    try:
+        if company_result.get("careers_url"):
+            allowed_domains.append(urlparse(company_result["careers_url"]).netloc)
+    except Exception:
+        pass
+    try:
+        if company_result.get("website"):
+            allowed_domains.append(urlparse(company_result["website"]).netloc)
+    except Exception:
+        pass
+
+    url_check = {"status": "inconclusive", "reason": "No URL provided"}
+    if job_url:
+        url_check = verify_job_url(job_url, job_title, allowed_domains)
+    items.append(("Official job URL", url_check))
+
+    # ATS validation
+    ats_check = {"status": "inconclusive", "reason": "No URL provided"}
+    if job_url:
+        ats_check = verify_ats_url(job_url, company_result.get("company_name", ""))
+    items.append(("ATS provider check", ats_check))
+
+    # Email domain check
+    emails = _extract_email_domains(job_description)
+    if not emails:
+        items.append(("Recruiter email domain", {"status": "inconclusive", "reason": "No email found"}))
+    else:
+        ok = any(_domain_in_list(e, allowed_domains) for e in emails)
+        status = "verified" if ok else "blocked"
+        reason = "Matches official domain" if ok else "Email domain does not match official domain"
+        items.append(("Recruiter email domain", {"status": status, "reason": reason, "emails": emails}))
+
+    # Fraud keywords already handled earlier; keep as info here
+    items.append(("Fraud keyword scan", {"status": "inconclusive", "reason": "See red-flag section above"}))
+
+    return items
+
+def compute_overall_verdict(matching_jobs, scrape_ok, checklist, fraud_score=0, company_verified=False, dynamic_site=False):
+    """Return verdict string: VERIFIED, GENUINE_LIKELY, UNVERIFIED, INCONCLUSIVE, HIGH_RISK."""
+    # Strong positive signals
+    if matching_jobs:
+        return "VERIFIED"
+    if any(item[1].get("status") == "verified" for item in checklist):
+        return "VERIFIED"
+    # High fraud score overrides
+    if fraud_score >= 70:
+        return "HIGH_RISK"
+    # Strong negative signals
+    if any(item[1].get("status") == "blocked" for item in checklist):
+        return "HIGH_RISK"
+    # Company is verified but portal is JS-heavy          cannot scrape, but company is REAL
+    # This is the key fix: don't label real jobs as INCONCLUSIVE just because we can't scrape
+    if company_verified and dynamic_site and not scrape_ok:
+        return "GENUINE_LIKELY"
+    # If we scraped and did not find the role, mark unverified (not fake)
+    if scrape_ok:
+        return "UNVERIFIED"
+    return "INCONCLUSIVE"
+
+class FraudSignalScorer:
+    """Multi-signal fraud scoring (no external APIs)."""
+
+    def __init__(self):
+        self.keywords = [
+            'urgent', 'urgently hiring', 'earn $', 'earn rs', 'per day', 'per week',
+            'work from phone', 'no experience needed', 'no interview', 'weekly payment',
+            'daily payment', 'whatsapp', 'telegram', 'guaranteed income', 'easy money',
+            'get rich', 'registration fee', 'pay to apply', 'processing fee', 'deposit required',
+            'send money', 'upfront payment', 'mlm', 'joining fee', 'advance payment',
+            'lottery', 'prize money', 'investment required', 'jackpot',
+            'click here to apply', 'limited seats', 'limited openings', 'work from home',
+            'data entry', 'typing job', 'part time', 'no skills required', 'only phone',
+            'paytm wallet', 'upi', 'bank transfer', 'telegram channel', 'whatsapp group'
+        ]
+        self.personal_data_terms = [
+            'aadhaar', 'aadhar', 'pan card', 'pan number', 'passport', 'bank account',
+            'ifsc', 'upi id', 'otp', 'cvv', 'debit card', 'credit card'
+        ]
+        self.free_email_domains = [
+            'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com', 'rediffmail.com'
+        ]
+
+    def _salary_risk(self, text):
+        # Very simple salary sanity check
+        patterns = [
+            r'(\d{4,7})\s*(?:per|/)\s*day',
+            r'(\d{5,8})\s*(?:per|/)\s*month',
+            r'(\d{6,9})\s*(?:per|/)\s*year',
+        ]
+        for pat in patterns:
+            for m in re.findall(pat, text):
+                try:
+                    val = int(m.replace(',', ''))
+                except Exception:
+                    continue
+                if 'day' in pat and val >= 5000:
+                    return 1.0
+                if 'month' in pat and val >= 500000:
+                    return 1.0
+                if 'year' in pat and val >= 10000000:
+                    return 0.8
+        return 0.0
+
+    def score(self, company_name, job_title, job_description, allowed_domains):
+        text = (job_title + " " + job_description).lower()
+        score = 0.0
+        breakdown = []
+
+        # Fraud keywords
+        kw_hits = [kw for kw in self.keywords if kw in text]
+        kw_factor = min(1.0, len(kw_hits) / 3.0)
+        score += 35 * kw_factor
+        breakdown.append(("Fraud keywords", 35 * kw_factor, kw_hits[:5]))
+
+        # Salary sanity
+        sal_factor = self._salary_risk(text)
+        score += 15 * sal_factor
+        breakdown.append(("Salary sanity", 15 * sal_factor, []))
+
+        # Company profile quality (very short or missing company name)
+        desc_len = len(job_description.strip())
+        quality_factor = 1.0 if desc_len < 300 else 0.5 if desc_len < 600 else 0.0
+        if company_name and company_name.lower() not in text:
+            quality_factor = max(quality_factor, 0.5)
+        score += 15 * quality_factor
+        breakdown.append(("Company/profile quality", 15 * quality_factor, []))
+
+        # Contact method
+        contact_factor = 1.0 if ("whatsapp" in text or "telegram" in text) else 0.0
+        score += 10 * contact_factor
+        breakdown.append(("Contact method", 10 * contact_factor, []))
+
+        # Description quality
+        desc_quality = 1.0 if desc_len < 200 else 0.5 if desc_len < 400 else 0.0
+        score += 10 * desc_quality
+        breakdown.append(("Description quality", 10 * desc_quality, []))
+
+        # Personal data request
+        pdata_hits = [t for t in self.personal_data_terms if t in text]
+        pdata_factor = 1.0 if pdata_hits else 0.0
+        score += 10 * pdata_factor
+        breakdown.append(("Personal data requests", 10 * pdata_factor, pdata_hits[:5]))
+
+        # Email domain check
+        emails = _extract_email_domains(job_description)
+        email_factor = 0.0
+        if emails:
+            for e in emails:
+                if e in self.free_email_domains:
+                    email_factor = 1.0
+                    break
+                if allowed_domains and not _domain_in_list(e, allowed_domains):
+                    email_factor = max(email_factor, 0.5)
+        score += 5 * email_factor
+        breakdown.append(("Email domain", 5 * email_factor, emails[:3]))
+
+        score = min(100, round(score, 1))
+        return score, breakdown
+
 # Set page config
 st.set_page_config(
     page_title="JobVerification AI - Real Job Openings Finder",
-    page_icon="🧠",
+    page_icon="                                   ",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -298,24 +612,8 @@ st.markdown("""
 # ==================== COMPANY DISCOVERY ENGINE ====================
 
 class CompanyDiscoveryEngine:
-    """
-    Multi-strategy company discovery engine.
+    # Multi-strategy company discovery engine.
 
-    Strategy 1 (fastest): Direct URL guessing from company name
-        - Constructs likely URLs like zoho.com, zoho.in, zoho.io etc.
-        - Hits them directly — no search engine dependency.
-
-    Strategy 2 (fallback): DuckDuckGo HTML search
-        - Only used if direct guessing fails.
-        - Parses DuckDuckGo result links (more scrape-friendly than Google/Bing).
-
-    For both strategies, once a website is found:
-        - Searches the homepage for a careers/jobs link.
-        - Falls back to trying common paths like /careers, /jobs.
-        - Validates that the careers page actually has job-related content.
-    """
-
-    # Excluded domains that should never be treated as a company website
     EXCLUDED_DOMAINS = {
         'google.com', 'bing.com', 'duckduckgo.com', 'yahoo.com',
         'facebook.com', 'linkedin.com', 'twitter.com', 'youtube.com',
@@ -337,9 +635,14 @@ class CompanyDiscoveryEngine:
 
     def __init__(self):
         self.session = self._create_session()
+        # Last scrape diagnostics to avoid false "fake" labels
+        self.last_error = None
+        self.last_status_code = None
+        self.last_fetch_ok = False
+        self.last_dynamic_site = False
 
     def _create_session(self):
-        """Create a requests session with browser-like headers"""
+        # Create a requests session with browser-like headers
         import requests
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
@@ -364,15 +667,8 @@ class CompanyDiscoveryEngine:
         })
         return session
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # PUBLIC API
-    # ──────────────────────────────────────────────────────────────────────────
-
     def discover_company(self, company_name):
-        """
-        Main method: try to find the company website + career page.
-        Returns a result dict with keys: found, careers_url, website, confidence, ...
-        """
+        # Try to find the company website + career page
         result = {
             'company_name': company_name,
             'found': False,
@@ -383,73 +679,59 @@ class CompanyDiscoveryEngine:
             'validation_details': [],
         }
 
-        # ── Strategy 1: Direct URL guessing ──────────────────────────────────
         website_url = self._guess_website_directly(company_name)
         if website_url:
             result['discovery_method'] = 'direct_url_guess'
             result['validation_details'].append(f"Strategy 1 succeeded: {website_url}")
         else:
-            # ── Strategy 2: DuckDuckGo HTML search ───────────────────────────
-            result['validation_details'].append("Strategy 1 (direct URL) failed — trying DuckDuckGo...")
+            result['validation_details'].append('Strategy 1 (direct URL) failed - trying DuckDuckGo...')
             website_url = self._search_duckduckgo(company_name)
             if website_url:
                 result['discovery_method'] = 'duckduckgo_search'
                 result['validation_details'].append(f"Strategy 2 (DuckDuckGo) found: {website_url}")
             else:
-                result['validation_details'].append("Strategy 2 (DuckDuckGo) also failed.")
+                result['validation_details'].append('Strategy 2 (DuckDuckGo) also failed.')
                 return result
 
         result['website'] = website_url
 
-        # ── Find careers page from the website ───────────────────────────────
         careers_url = self._find_careers_page(website_url)
         if not careers_url:
-            result['validation_details'].append("Website found but no careers page detected.")
+            result['validation_details'].append('Website found but no careers page detected.')
             return result
 
         result['careers_url'] = careers_url
         result['validation_details'].append(f"Careers page found: {careers_url}")
 
-        # ── Validate: is this genuinely a company careers page? ───────────────
         score = self._score_careers_page(careers_url)
         result['confidence'] = round(score * 100, 1)
         result['validation_details'].append(f"Validation score: {score:.0%}")
 
-        if score >= 0.5:   # Threshold lowered from 0.7 to 0.5
+        if score >= 0.5:
             result['found'] = True
         else:
-            result['validation_details'].append("Score below 50% threshold — not confident enough.")
+            result['validation_details'].append('Score below 50% threshold - not confident enough.')
 
         return result
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STRATEGY 1 — DIRECT URL GUESSING
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _guess_website_directly(self, company_name):
-        """
-        Construct candidate URLs from the company name and probe them directly.
-        E.g. "Zoho Corporation"  → zoho.com, zoho.in, zoho.io, zohocorporation.com ...
-        """
-        # Build slug variants
+        # Construct candidate URLs from the company name and probe them directly.
         words = company_name.lower().split()
-        # Remove generic suffixes so "tata motors" → "tatamotors" AND "tata"
         stop_words = {'limited', 'ltd', 'pvt', 'private', 'inc', 'corp',
                       'corporation', 'technologies', 'technology', 'solutions',
                       'systems', 'services', 'group', 'india', 'global',
-                      'international', 'enterprises', 'consulting'}
+                      'international', 'enterprises', 'consulting', 'the'}
         core_words = [w for w in words if w not in stop_words]
 
         name_variants = list(dict.fromkeys([
-            ''.join(core_words),            # zohocorporation → zoho
-            core_words[0] if core_words else '',   # first word only
-            ''.join(words),                 # full slug
-            '-'.join(core_words),           # zoho-corporation
+            ''.join(core_words),
+            core_words[0] if core_words else '',
+            company_name.lower().replace(' ', ''),
+            company_name.lower().replace(' ', '-'),
         ]))
         name_variants = [v for v in name_variants if v]
 
-        tlds = ['.com', '.in', '.io', '.co', '.net', '.org', '.co.in']
-
+        tlds = ['.com', '.in', '.io', '.co', '.net', '.org']
         candidates = []
         for variant in name_variants:
             for tld in tlds:
@@ -458,10 +740,12 @@ class CompanyDiscoveryEngine:
 
         for url in candidates:
             try:
-                resp = self.session.get(url, timeout=8, verify=False,
+                self.session.headers['User-Agent'] = random.choice(USER_AGENTS)
+                resp = self.session.get(url, timeout=(5, 10), verify=False,
+                                        proxies=get_active_proxies(),
                                         allow_redirects=True)
                 if resp.status_code == 200 and len(resp.content) > 500:
-                    final_url = resp.url  # follow redirects
+                    final_url = resp.url
                     if self._is_plausible_company_site(final_url, company_name, resp.text):
                         return final_url
             except Exception:
@@ -470,22 +754,17 @@ class CompanyDiscoveryEngine:
         return None
 
     def _is_plausible_company_site(self, url, company_name, html_text=''):
-        """
-        Heuristic: does this URL look like the company's own website?
-        Returns True if at least one core word appears in the domain.
-        """
+        # Heuristic: does this URL look like the company's own website?
         from urllib.parse import urlparse
         try:
             domain = urlparse(url).netloc.lower().replace('www.', '')
         except Exception:
             return False
 
-        # Must not be an excluded domain
         for excl in self.EXCLUDED_DOMAINS:
             if excl in domain:
                 return False
 
-        # At least one meaningful company word must appear in the domain
         words = company_name.lower().split()
         stop_words = {'limited', 'ltd', 'pvt', 'private', 'inc', 'corp',
                       'corporation', 'technologies', 'technology', 'solutions',
@@ -495,16 +774,9 @@ class CompanyDiscoveryEngine:
 
         return any(w in domain for w in core_words)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STRATEGY 2 — DUCKDUCKGO HTML SEARCH
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _search_duckduckgo(self, company_name):
-        """
-        Search DuckDuckGo (HTML version) for the company's official website.
-        DuckDuckGo is more scrape-tolerant than Google/Bing.
-        """
-        from urllib.parse import quote, urlparse
+        # Search DuckDuckGo (HTML version) for the company's official website.
+        from urllib.parse import quote, unquote, parse_qs
         queries = [
             f'{company_name} official website',
             f'{company_name} careers site:*.com OR site:*.in OR site:*.io',
@@ -513,27 +785,25 @@ class CompanyDiscoveryEngine:
         for query in queries:
             try:
                 url = f'https://duckduckgo.com/html/?q={quote(query)}'
-                resp = self.session.get(url, timeout=12, verify=False)
+                self.session.headers['User-Agent'] = random.choice(USER_AGENTS)
+                resp = self.session.get(url, timeout=(5, 12), verify=False, proxies=get_active_proxies())
                 if resp.status_code != 200:
                     continue
 
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(resp.text, 'html.parser')
 
-                # DuckDuckGo HTML results: <a class="result__a" href="...">
                 for tag in soup.select('a.result__a, .result__url, a[href*="http"]'):
                     href = tag.get('href', '')
-                    # DuckDuckGo wraps URLs: /l/?kh=-1&uddg=https%3A%2F%2F...
                     if 'uddg=' in href:
-                        from urllib.parse import unquote, parse_qs
                         qs = parse_qs(href.split('?', 1)[-1])
                         href = unquote(qs.get('uddg', [''])[0])
                     if href.startswith('http') and self._is_plausible_company_site(href, company_name):
-                        # Quick liveness check
                         try:
-                            r2 = self.session.get(href, timeout=8, verify=False)
-                            if r2.status_code == 200 and len(r2.content) > 500:
-                                return r2.url   # return the final URL after redirects
+                            self.session.headers['User-Agent'] = random.choice(USER_AGENTS)
+                            r2 = self.session.get(href, timeout=8, verify=False, proxies=get_active_proxies())
+                            if r2.status_code == 200 and len(r2.content) > 300:
+                                return r2.url
                         except Exception:
                             continue
             except Exception:
@@ -541,21 +811,14 @@ class CompanyDiscoveryEngine:
 
         return None
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # CAREERS PAGE FINDER
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _find_careers_page(self, website_url):
-        """
-        1. Fetch homepage and look for a careers/jobs link.
-        2. If not found, probe common /careers, /jobs, ... paths directly.
-        """
-        from urllib.parse import urljoin
+        # 1) Scan homepage links. 2) Probe common paths.
+        from urllib.parse import urljoin, urlparse
         from bs4 import BeautifulSoup
 
-        # ── Step A: scan homepage links ──────────────────────────────────────
         try:
-            resp = self.session.get(website_url, timeout=10, verify=False)
+            self.session.headers['User-Agent'] = random.choice(USER_AGENTS)
+            resp = self.session.get(website_url, timeout=(5, 10), verify=False, proxies=get_active_proxies())
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 for a in soup.find_all('a', href=True):
@@ -569,8 +832,6 @@ class CompanyDiscoveryEngine:
         except Exception:
             pass
 
-        # ── Step B: probe common career paths ───────────────────────────────
-        from urllib.parse import urlparse
         base = '{uri.scheme}://{uri.netloc}'.format(uri=urlparse(website_url))
         for path in self.CAREER_PATHS:
             candidate = base + path
@@ -580,9 +841,10 @@ class CompanyDiscoveryEngine:
         return None
 
     def _is_careers_url_valid(self, url):
-        """Return True if the URL is accessible and looks like a careers page."""
+        # Return True if the URL is accessible and looks like a careers page.
         try:
-            resp = self.session.get(url, timeout=8, verify=False)
+            self.session.headers['User-Agent'] = random.choice(USER_AGENTS)
+            resp = self.session.get(url, timeout=(5, 8), verify=False, proxies=get_active_proxies())
             if resp.status_code == 200 and len(resp.content) > 300:
                 text = resp.text.lower()
                 hits = sum(1 for kw in ['job', 'career', 'apply', 'position',
@@ -593,386 +855,221 @@ class CompanyDiscoveryEngine:
             pass
         return False
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # VALIDATION SCORER
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _score_careers_page(self, careers_url):
-        """
-        Give a 0–1 confidence score that the careers_url is a real company
-        careers page (not a job board or aggregator).
-        """
+        # Give a 0-1 confidence score that the careers_url is a real company careers page.
         from bs4 import BeautifulSoup
         score = 0.0
         try:
-            resp = self.session.get(careers_url, timeout=10, verify=False)
+            self.session.headers['User-Agent'] = random.choice(USER_AGENTS)
+            resp = self.session.get(careers_url, timeout=10, verify=False, proxies=get_active_proxies())
             if resp.status_code == 200:
-                score += 0.4   # page is live
+                score += 0.4
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 text = soup.get_text().lower()
 
-                # Job-related terms
                 job_terms = ['apply', 'position', 'opening', 'vacancy', 'career',
                              'job', 'hire', 'opportunity', 'full-time', 'part-time']
                 hits = sum(1 for t in job_terms if t in text)
-                score += min(hits * 0.06, 0.3)    # up to +0.3
+                score += min(hits * 0.06, 0.3)
 
-                # Professional page indicators
                 if soup.find('nav') or len(soup.find_all('ul')) > 2:
                     score += 0.15
                 if soup.find('footer'):
                     score += 0.1
                 if soup.find('title') and soup.find('title').string:
-                    score += 0.05
+                    title = soup.find('title').string.lower()
+                    if any(t in title for t in ['careers', 'jobs', 'work with us']):
+                        score += 0.05
         except Exception:
             pass
         return min(score, 1.0)
 
-# ==================== 100% REAL JOB SCRAPER ====================
 
 class RealJobScraper:
-    """100% Real job scraper - Only shows ACTUAL job openings from company websites"""
-    
     def __init__(self):
         self.session = self._create_session()
-        
+        # Last scrape diagnostics to avoid false "fake" labels
+        self.last_error = None
+        self.last_status_code = None
+        self.last_fetch_ok = False
+        self.last_dynamic_site = False
+
     def _create_session(self):
-        """Create robust session for web scraping"""
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
         session = requests.Session()
         retry_strategy = Retry(
             total=3,
-            backoff_factor=1,
+            backoff_factor=0.7,
             status_forcelist=[429, 500, 502, 503, 504],
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
         session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
         })
         return session
-    
-    def scrape_real_jobs(self, company_name, careers_url, search_title=None):
-        """Scrape ONLY REAL job openings from company career page - NO FALLBACK DATA"""
-        if not careers_url:
-            return []
-        
-        try:
-            # Show real-time scraping progress
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            status_text.text("🔍 Connecting to company career page...")
-            progress_bar.progress(20)
-            
-            # Get the careers page
-            response = self.session.get(careers_url, timeout=15, verify=False)
-            if response.status_code != 200:
-                st.warning(f"⚠️ Could not access {company_name} career page (Status: {response.status_code})")
-                return []
-            
-            status_text.text("📄 Analyzing career page content...")
-            progress_bar.progress(50)
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            status_text.text("🎯 Extracting real job openings...")
-            progress_bar.progress(80)
-            
-            # Extract REAL job listings
-            jobs = self._extract_real_jobs(soup, company_name, careers_url, search_title)
-            
-            progress_bar.progress(100)
-            status_text.empty()
-            
-            if jobs:
-                st.success(f"✅ Found {len(jobs)} REAL job openings at {company_name}")
-                return jobs
-            else:
-                st.info(f"ℹ️ No current job openings found on {company_name}'s career page")
-                return []
-                
-        except Exception as e:
-            st.error(f"❌ Error scraping {company_name}: {str(e)}")
-            return []
-    
-    def _extract_real_jobs(self, soup, company_name, base_url, search_title):
-        """Extract ONLY REAL job listings from HTML - NO FAKE DATA"""
-        jobs = []
-        
-        # Comprehensive job listing detection
-        jobs.extend(self._find_jobs_by_selectors(soup, company_name, base_url))
-        jobs.extend(self._find_jobs_by_links(soup, company_name, base_url))
-        jobs.extend(self._find_jobs_by_keywords(soup, company_name, base_url))
-        
-        # Filter for relevance if search title provided
-        if search_title:
-            jobs = [job for job in jobs if self._is_relevant_to_search(job['title'], search_title)]
-        
-        # Remove duplicates and limit results
-        unique_jobs = self._remove_duplicates(jobs)
-        return unique_jobs[:10]  # Return max 10 real jobs
-    
-    def _find_jobs_by_selectors(self, soup, company_name, base_url):
-        """Find jobs using common CSS selectors"""
-        jobs = []
-        
-        # Comprehensive list of job listing selectors used by real companies
-        job_selectors = [
-            # Common career page structures
-            '.job-listing', '.job-item', '.careers-item', '.position',
-            '.job-post', '.opening', '.vacancy', '.role',
-            '.job-card', '.career-item', '.job-opening',
-            
-            # Company-specific selectors
-            '[data-cy="job-item"]', '[data-testid="job-item"]',
-            '.jobs-list-item', '.careers-list-item',
-            '.job-list-item', '.opening-list-item',
-            
-            # Generic job containers
-            '[class*="job"]', '[class*="career"]', '[class*="position"]',
-            '[class*="opening"]', '[class*="vacancy"]', '[class*="role"]',
-            
-            # List items that might contain jobs
-            'li.job', 'li.career', 'li.position',
-            'div.job', 'div.career', 'div.position'
-        ]
-        
-        for selector in job_selectors:
-            try:
-                elements = soup.select(selector)
-                for elem in elements:
-                    job = self._parse_job_element(elem, company_name, base_url)
-                    if job and self._is_valid_job(job):
-                        jobs.append(job)
-            except Exception as e:
-                continue
-        
-        return jobs
-    
-    def _find_jobs_by_links(self, soup, company_name, base_url):
-        """Find jobs by analyzing links"""
-        jobs = []
-        job_links = soup.find_all('a', href=True)
-        
-        for link in job_links:
-            try:
-                href = link.get('href', '').lower()
-                text = link.get_text('', strip=True)
-                
-                # Check if this looks like a job link
-                if self._is_job_link(href, text) and len(text) > 10:
-                    job = {
-                        'title': text,
-                        'url': urljoin(base_url, href),
-                        'company': company_name,
-                        'location': self._extract_location_from_context(link),
-                        'type': 'Full-time',
-                        'source': 'Official Careers Page',
-                        'posted': 'Current'
-                    }
-                    if self._is_valid_job(job):
-                        jobs.append(job)
-            except:
-                continue
-        
-        return jobs
-    
-    def _find_jobs_by_keywords(self, soup, company_name, base_url):
-        """Find jobs by searching for job-related keywords in the page"""
-        jobs = []
-        job_keywords = [
-            'software engineer', 'developer', 'analyst', 'manager',
-            'data scientist', 'cloud engineer', 'devops', 'qa',
-            'product manager', 'business analyst', 'consultant'
-        ]
-        
-        # Get all text elements that might contain job titles
-        text_elements = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'strong', 'b', 'span', 'div'])
-        
-        for element in text_elements:
-            text = element.get_text(strip=True)
-            if text and len(text) > 10 and len(text) < 100:
-                for keyword in job_keywords:
-                    if keyword.lower() in text.lower():
-                        job = {
-                            'title': text,
-                            'url': base_url,
-                            'company': company_name,
-                            'location': 'Multiple Locations',
-                            'type': 'Full-time',
-                            'source': 'Official Careers Page',
-                            'posted': 'Current'
-                        }
-                        if self._is_valid_job(job) and job not in jobs:
-                            jobs.append(job)
-                            break
-        
-        return jobs
-    
-    def _parse_job_element(self, element, company_name, base_url):
-        """Parse job information from HTML element"""
-        try:
-            # Extract title from various possible elements
-            title = None
-            title_elements = element.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'strong', 'b', 'span'])
-            
-            for title_elem in title_elements:
-                text = title_elem.get_text(strip=True)
-                if text and len(text) > 5 and len(text) < 100:
-                    title = text
-                    break
-            
-            if not title:
-                # Try the element itself
-                title = element.get_text(strip=True)
-                if len(title) < 5 or len(title) > 100:
-                    return None
-            
-            # Extract URL
-            link_elem = element if element.name == 'a' else element.find('a', href=True)
-            job_url = base_url
-            if link_elem and link_elem.get('href'):
-                job_url = urljoin(base_url, link_elem.get('href'))
-            
-            return {
-                'title': title,
-                'url': job_url,
-                'company': company_name,
-                'location': self._extract_location_from_element(element),
-                'type': self._extract_job_type_from_element(element),
-                'source': 'Official Careers Page',
-                'posted': 'Current'
-            }
-        except:
-            return None
-    
-    def _is_job_link(self, href, text):
-        """Check if link is job-related"""
-        job_url_patterns = ['/job', '/career', '/position', '/opening', '/vacancy', '/apply']
-        job_text_patterns = ['job', 'career', 'position', 'opening', 'vacancy', 'apply', 'hire']
-        
-        href_match = any(pattern in href for pattern in job_url_patterns)
-        text_match = any(pattern in text.lower() for pattern in job_text_patterns)
-        
-        return href_match or text_match
-    
-    def _is_valid_job(self, job):
-        """Validate that this is a real job posting"""
-        if not job or not job.get('title'):
-            return False
-        
-        title = job['title'].lower()
-        
-        # Exclude navigation and footer elements
-        exclude_patterns = [
-            'home', 'about', 'contact', 'login', 'signup', 'privacy', 'terms',
-            'blog', 'news', 'events', 'support', 'help', 'faq'
-        ]
-        
-        if any(pattern in title for pattern in exclude_patterns):
-            return False
-        
-        # Should be a reasonable length
-        if len(job['title']) < 5 or len(job['title']) > 100:
-            return False
-        
-        return True
-    
-    def _is_relevant_to_search(self, job_title, search_title):
-        """Check if job is relevant to the search query"""
-        if not search_title:
-            return True
-        
-        job_lower = job_title.lower()
-        search_lower = search_title.lower()
-        
-        # Check for direct keyword matches
-        job_words = set(re.findall(r'\w+', job_lower))
-        search_words = set(re.findall(r'\w+', search_lower))
-        
-        common_words = job_words.intersection(search_words)
-        return len(common_words) >= 1
-    
-    def _extract_location_from_element(self, element):
-        """Extract location from job element"""
-        try:
-            # Look for location in nearby elements
-            location_selectors = ['.location', '.loc', '.place', '.city', '.country', '.office']
-            for selector in location_selectors:
-                loc_elem = element.select_one(selector)
-                if loc_elem:
-                    return loc_elem.get_text(strip=True)
-            
-            # Check parent and sibling elements
-            parent = element.parent
-            if parent:
-                for selector in location_selectors:
-                    loc_elem = parent.select_one(selector)
-                    if loc_elem:
-                        return loc_elem.get_text(strip=True)
-        except:
-            pass
-        
-        return 'Multiple Locations'
-    
-    def _extract_location_from_context(self, element):
-        """Extract location from link context"""
-        try:
-            # Check sibling elements for location
-            parent = element.parent
-            if parent:
-                location_elements = parent.find_all(class_=re.compile('location|loc|place', re.I))
-                if location_elements:
-                    return location_elements[0].get_text(strip=True)
-        except:
-            pass
-        
-        return 'Multiple Locations'
-    
-    def _extract_job_type_from_element(self, element):
-        """Extract job type from element"""
-        try:
-            type_selectors = ['.type', '.employment-type', '.job-type', '.time-type']
-            for selector in type_selectors:
-                type_elem = element.select_one(selector)
-                if type_elem:
-                    text = type_elem.get_text(strip=True).lower()
-                    if any(t in text for t in ['full', 'permanent']):
-                        return 'Full-time'
-                    elif 'part' in text:
-                        return 'Part-time'
-                    elif 'contract' in text:
-                        return 'Contract'
-        except:
-            pass
-        
-        return 'Full-time'
-    
-    def _remove_duplicates(self, jobs):
-        """Remove duplicate job listings"""
-        seen_titles = set()
-        unique_jobs = []
-        
-        for job in jobs:
-            # Normalize title for comparison
-            normalized_title = re.sub(r'[^a-zA-Z0-9]', '', job['title'].lower())
-            if normalized_title not in seen_titles:
-                unique_jobs.append(job)
-                seen_titles.add(normalized_title)
-        
-        return unique_jobs
 
-# ==================== SELF LEARNING COMPANY VERIFIER ====================
+    def _reset_diagnostics(self):
+        self.last_error = None
+        self.last_status_code = None
+        self.last_fetch_ok = False
+        self.last_dynamic_site = False
+
+    def _detect_dynamic_site(self, html_text):
+        # Heuristic: if it is heavily JS-driven, scraping may be incomplete
+        lowered = html_text.lower()
+        signals = [
+            'data-reactroot', 'ng-version', 'window.__initial_state__',
+            'react-root', 'vue-app', 'angular', 'application/json',
+        ]
+        return any(s in lowered for s in signals)
+
+    def _extract_jobs_from_jsonld(self, html_text, base_url=None):
+        jobs = []
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html_text, 'html.parser')
+            for script in soup.select('script[type="application/ld+json"]'):
+                raw = script.string or script.get_text(strip=True)
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('@type') != 'JobPosting':
+                        continue
+                    title = item.get('title') or item.get('name')
+                    if not title:
+                        continue
+                    url = item.get('url') or base_url
+                    location = None
+                    job_loc = item.get('jobLocation')
+                    if isinstance(job_loc, dict):
+                        addr = job_loc.get('address', {}) if isinstance(job_loc.get('address'), dict) else {}
+                        parts = [addr.get('addressLocality'), addr.get('addressRegion'), addr.get('addressCountry')]
+                        location = ', '.join([p for p in parts if p]) if any(parts) else None
+                    elif isinstance(job_loc, list) and job_loc:
+                        loc0 = job_loc[0]
+                        if isinstance(loc0, dict):
+                            addr = loc0.get('address', {}) if isinstance(loc0.get('address'), dict) else {}
+                            parts = [addr.get('addressLocality'), addr.get('addressRegion'), addr.get('addressCountry')]
+                            location = ', '.join([p for p in parts if p]) if any(parts) else None
+
+                    jobs.append({
+                        'title': title.strip(),
+                        'company': item.get('hiringOrganization', {}).get('name') if isinstance(item.get('hiringOrganization'), dict) else None,
+                        'location': location,
+                        'url': url,
+                        'source': 'jsonld',
+                    })
+        except Exception:
+            return jobs
+        return jobs
+
+    def _extract_jobs_from_links(self, soup, base_url):
+        jobs = []
+        from urllib.parse import urljoin
+        for a in soup.find_all('a', href=True):
+            href = a.get('href', '')
+            text = a.get_text(strip=True)
+            if not text:
+                continue
+            lower = (text + ' ' + href).lower()
+            if any(k in lower for k in ['job', 'career', 'opening', 'position', 'apply', 'vacancy']):
+                url = urljoin(base_url, href)
+                jobs.append({
+                    'title': text,
+                    'company': None,
+                    'location': None,
+                    'url': url,
+                    'source': 'links',
+                })
+        return jobs
+
+    def _filter_by_title(self, jobs, search_title):
+        if not search_title:
+            return jobs
+        q = re.sub(r'[^a-z0-9]+', ' ', search_title.lower()).strip()
+        q_words = set(q.split())
+        if not q_words:
+            return jobs
+        out = []
+        for job in jobs:
+            title = job.get('title', '')
+            t = re.sub(r'[^a-z0-9]+', ' ', title.lower()).strip()
+            if not t:
+                continue
+            t_words = set(t.split())
+            if q in t or (q_words and len(q_words.intersection(t_words)) >= max(1, len(q_words)//2)):
+                out.append(job)
+        return out
+
+    def scrape_real_jobs(self, company_name, careers_url, search_title=None):
+        # Scrape REAL job openings from company career page
+        self._reset_diagnostics()
+        if not careers_url:
+            self.last_error = 'No careers URL provided.'
+            return []
+
+        try:
+            self.session.headers['User-Agent'] = random.choice(USER_AGENTS)
+            resp = self.session.get(careers_url, timeout=(6, 14), verify=False, proxies=get_active_proxies())
+            self.last_status_code = resp.status_code
+            if resp.status_code != 200:
+                self.last_error = f'HTTP {resp.status_code} when fetching careers page.'
+                return []
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+
+        self.last_fetch_ok = True
+        html_text = resp.text or ''
+        self.last_dynamic_site = self._detect_dynamic_site(html_text)
+
+        jobs = []
+        jobs.extend(self._extract_jobs_from_jsonld(html_text, base_url=resp.url))
+
+        if not jobs:
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html_text, 'html.parser')
+                jobs.extend(self._extract_jobs_from_links(soup, resp.url))
+            except Exception:
+                pass
+
+        jobs = self._filter_by_title(jobs, search_title)
+
+        # De-duplicate by title + url
+        unique = []
+        seen = set()
+        for job in jobs:
+            key = (job.get('title', '').lower(), job.get('url', ''))
+            if key in seen:
+                continue
+            seen.add(key)
+            if not job.get('company'):
+                job['company'] = company_name
+            unique.append(job)
+
+        return unique
+
 
 class SelfLearningCompanyVerifier:
-    """Enhanced company verifier with automatic discovery capabilities"""
+    # Enhanced company verifier with automatic discovery capabilities
     
     def __init__(self):
         self.known_companies = self._load_company_database()
@@ -981,7 +1078,7 @@ class SelfLearningCompanyVerifier:
         self.learning_enabled = True
         
     def _load_company_database(self):
-        """Load comprehensive Indian company database with 150+ companies"""
+        # Load comprehensive Indian company database
         try:
             if os.path.exists('company_database.json'):
                 with open('company_database.json', 'r') as f:
@@ -1869,7 +1966,7 @@ class SelfLearningCompanyVerifier:
         }
     
     def _save_company_database(self):
-        """Save updated company database"""
+        # Save updated company database
         try:
             with open('company_database.json', 'w') as f:
                 json.dump(self.known_companies, f, indent=2)
@@ -1877,7 +1974,7 @@ class SelfLearningCompanyVerifier:
             pass
     
     def verify_company(self, company_name, enable_discovery=True):
-        """Verify company with optional auto-discovery"""
+        # Verify company with optional auto-discovery
         if not company_name or len(company_name.strip()) < 2:
             return self._error_result("No company name provided")
         
@@ -1898,7 +1995,7 @@ class SelfLearningCompanyVerifier:
         return self._not_found_result(company_name_clean)
     
     def _check_existing_companies(self, company_lower, company_name_clean):
-        """Check against known companies database"""
+        # Check against known companies database
         if company_lower in self.known_companies:
             return {
                 "is_genuine": True,
@@ -1924,8 +2021,8 @@ class SelfLearningCompanyVerifier:
         return {"is_genuine": False}
     
     def _attempt_auto_discovery(self, company_name_clean, company_lower):
-        """Attempt to auto-discover new company"""
-        with st.spinner(f"🤖 **AI Discovery**: Learning about '{company_name_clean}'..."):
+        # Attempt to auto-discover new company
+        with st.spinner(f"                                             **AI Discovery**: Learning about '{company_name_clean}'..."):
             discovery_result = self.discovery_engine.discover_company(company_name_clean)
         
         if discovery_result['found'] and discovery_result['careers_url']:
@@ -1966,7 +2063,7 @@ class SelfLearningCompanyVerifier:
         }
     
     def get_database_stats(self):
-        """Get statistics about the company database"""
+        # Get statistics about the company database
         return {
             "total_companies": len(self.known_companies),
             "auto_learned_companies": len([k for k, v in self.known_companies.items() 
@@ -1978,8 +2075,8 @@ class SelfLearningCompanyVerifier:
 # ==================== MAIN APPLICATION ====================
 
 def main():
-    st.markdown('<h1 class="main-header">🧠 JobVerification AI <span class="ai-badge">REAL JOBS ONLY</span></h1>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Verify Job Postings — Fraud Detection + Real Career Page Matching</p>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">                                    JobVerification AI <span class="ai-badge">REAL JOBS ONLY</span></h1>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Verify Job Postings                                        Fraud Detection + Real Career Page Matching</p>', unsafe_allow_html=True)
 
     # Initialize components
     company_verifier = SelfLearningCompanyVerifier()
@@ -1997,14 +2094,18 @@ def main():
         st.metric("Real Job Scraping", "ACTIVE")
     with col4:
         st.metric("Fraud Detection", "ON")
-    st.caption("💡 Step 1: Fraud keyword scan → Step 2: Company lookup → Step 3: Live career page match")
+    st.caption("                                             Step 1: Fraud keyword scan                                           Step 2: Company lookup                                           Step 3: Live career page match")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ──────────────────────────────────────────────────────────────
+    #                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
     # STEP 1: INPUT FORM
-    # ──────────────────────────────────────────────────────────────
+    #                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### 📝 Enter Job Posting Details for Verification")
+    with st.expander("Network / Proxy Settings (optional)"):
+        st.checkbox("Use proxy", key="use_proxy")
+        st.text_input("HTTP proxy (e.g., http://user:pass@host:port)", key="proxy_http")
+        st.text_input("HTTPS proxy (e.g., http://user:pass@host:port)", key="proxy_https")
+    st.markdown("###                                            Enter Job Posting Details for Verification")
     col1, col2 = st.columns(2)
     with col1:
         company_name = st.text_input("**Company Name** *(required)*",
@@ -2015,99 +2116,95 @@ def main():
         job_description = st.text_area("**Job Description** *(required)*",
                                        placeholder="Paste the full job description here...",
                                        height=130)
+        job_url = st.text_input("**Job Posting URL** *(optional)*",
+                                placeholder="Paste the official job posting link (if available)")
+        enable_ml = st.checkbox("**Enable ML Model Scoring** *(slower on first run)*", value=False,
+                                help="Loads the ML model to score text risk. First run may be slow.")
         enable_discovery = st.checkbox("**Enable AI Auto-Discovery**", value=True,
                                        help="Automatically find companies not yet in the database via web scraping")
-    verify_clicked = st.button("**🔍 Analyze & Verify Job Posting**",
+    verify_clicked = st.button("**                                          Analyze & Verify Job Posting**",
                                use_container_width=True, type="primary")
     st.markdown('</div>', unsafe_allow_html=True)
 
     if verify_clicked:
+        status = st.empty()
+        status.info("Starting verification...")
         # Validate all fields
         if not company_name.strip():
-            st.warning("⚠️ Please enter the **Company Name**.")
+            st.warning("                                                     Please enter the **Company Name**.")
             return
         if not job_title.strip():
-            st.warning("⚠️ Please enter the **Job Role / Title**.")
+            st.warning("                                                     Please enter the **Job Role / Title**.")
             return
         if not job_description.strip():
-            st.warning("⚠️ Please paste the **Job Description**.")
+            st.warning("                                                     Please paste the **Job Description**.")
             return
 
 
         # STEP 1: ML fraud score (text-only in UI)
-        model, tokenizer = load_fraud_model_assets()
-        ml_score = None
-        if model is None or tokenizer is None:
-            st.info("ML model not loaded. Run training to enable model-based scoring.")
+        if enable_ml:
+            with st.spinner("Loading ML model and scoring text..."):
+                model, tokenizer = load_fraud_model_assets()
+                ml_score = None
+                if model is None or tokenizer is None:
+                    st.info("ML model not loaded. Run training to enable model-based scoring.")
+                else:
+                    try:
+                        ml_score = predict_fraud_score(model, tokenizer, job_title.strip(), job_description.strip())
+                        ml_pct = round(ml_score * 100, 1)
+                        risk_label = "LOW" if ml_score < 0.3 else "MEDIUM" if ml_score < 0.6 else "HIGH"
+                        st.markdown(
+                            f"**ML Risk Score:** {ml_pct}% (Text-only, metadata assumed neutral) | **Risk:** {risk_label}"
+                        )
+                    except Exception as e:
+                        st.warning(f"ML scoring failed: {e}")
         else:
-            try:
-                ml_score = predict_fraud_score(model, tokenizer, job_title.strip(), job_description.strip())
-                ml_pct = round(ml_score * 100, 1)
-                risk_label = "LOW" if ml_score < 0.3 else "MEDIUM" if ml_score < 0.6 else "HIGH"
-                st.markdown(
-                    f"**ML Risk Score:** {ml_pct}% (Text-only, metadata assumed neutral) | **Risk:** {risk_label}"
-                )
-            except Exception as e:
-                st.warning(f"ML scoring failed: {e}")
+            st.caption("ML scoring is disabled for faster response.")
 
-        # ──────────────────────────────────────────────────────────────
-        # STEP 2: FRAUD KEYWORD CHECK — runs FIRST, before any web call
-        # ──────────────────────────────────────────────────────────────
-        FRAUD_KEYWORDS = [
-            'urgent', 'urgently hiring', 'earn $', '5000$', '$5000',
-            'earn money', 'earn rs', 'earn per day', 'earn per week',
-            'work from phone', 'no experience needed', 'no experience required',
-            'no interview', 'weekly payment', 'daily payment',
-            'whatsapp', 'telegram', 'guaranteed income', 'make money fast',
-            'easy money', 'get rich', 'part time earn', 'home based earn',
-            'click here to apply', 'limited seats', 'registration fee',
-            'pay to apply', 'processing fee', 'deposit required',
-            'send money', 'courier job', 'quick money', 'upfront payment',
-            'mlm', 'referral earn', 'joining fee', 'advance payment',
-            'lottery', 'prize money', 'investment required', 'jackpot'
-        ]
+        #                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+        # STEP 2: FRAUD KEYWORD CHECK                                        runs FIRST, before any web call
+        #                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             # STEP 2: FRAUD SIGNAL SCORING   runs FIRST, before any web call
+        scorer = FraudSignalScorer()
+        fraud_score, fraud_breakdown = scorer.score(company_name.strip(), job_title.strip(), job_description.strip(), [])
 
-        desc_lower = job_description.lower()
-        found_fraud_keywords = [kw for kw in FRAUD_KEYWORDS if kw in desc_lower]
+        st.markdown("### Fraud Risk Score")
+        st.metric("Fraud Risk Score", str(fraud_score) + "/100")
+        with st.expander("Fraud Signal Breakdown"):
+            for label, pts, hints in fraud_breakdown:
+                hint_text = " | " + ", ".join(hints) if hints else ""
+                st.write(label + ": " + str(round(pts, 1)) + " pts" + hint_text)
 
-        if found_fraud_keywords:
-            # ── RESULT: FRAUDULENT JOB POSTING ──────────────────────
+        if fraud_score >= 70:
             st.markdown('<div class="fake-card">', unsafe_allow_html=True)
-            st.markdown("""
-            <div style='font-size:3rem;margin-bottom:0.5rem;'>&#128680;</div>
-            <div style='font-size:2rem;font-weight:800;color:#991b1b;'>FRAUDULENT JOB POSTING DETECTED</div>
-            <div style='font-size:1.1rem;color:#7f1d1d;margin-top:0.5rem;'>
-                This job description contains known fraud indicators.
-                <strong>Do NOT apply or share personal/financial details.</strong>
-            </div>
-            """, unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            st.error(
-                "**Red Flag Keywords Found (" + str(len(found_fraud_keywords)) + "):**\n\n" +
-                "\n".join(["- `" + kw + "`" for kw in found_fraud_keywords])
+            st.markdown(
+                "<div style='font-size:3rem;margin-bottom:0.5rem;'>&#128680;</div>"
+                "<div style='font-size:2rem;font-weight:800;color:#991b1b;'>HIGH RISK JOB POSTING</div>"
+                "<div style='font-size:1.1rem;color:#7f1d1d;margin-top:0.5rem;'>"
+                "This job description shows multiple scam indicators."
+                "<strong>Do NOT apply or share personal/financial details.</strong>"
+                "</div>",
+                unsafe_allow_html=True
             )
-            st.markdown("""
-**What You Should Do:**
-- Do NOT pay any registration, processing, or joining fee
-- Do NOT share Aadhaar, PAN, bank details, or OTPs with the recruiter
-- Do NOT contact via WhatsApp or Telegram for job offers
-- Report at [cybercrime.gov.in](https://cybercrime.gov.in)
-- Always verify openings on the company's official website directly
-            """)
-            return  # Stop — no further processing needed
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown(
+                "**What You Should Do:**\n"
+                "- Do NOT pay any registration, processing, or joining fee\n"
+                "- Do NOT share Aadhaar, PAN, bank details, or OTPs with the recruiter\n"
+                "- Do NOT contact via WhatsApp or Telegram for job offers\n"
+                "- Always verify openings on the company's official website directly"
+            )
+            return  # Stop   no further processing needed
 
-        # No fraud keywords found — proceed
-        st.info("Step 2 PASSED: No fraud indicators detected. Now verifying the company...")
+        st.info("Step 2 PASSED: No high-risk fraud indicators detected. Now verifying the company...")
 
-        # ──────────────────────────────────────────────────────────────
+        #                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
         # STEP 3 / STEP 5: COMPANY LOOKUP + AUTO-DISCOVERY IF NOT IN DB
-        # ──────────────────────────────────────────────────────────────
+        #                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
         with st.spinner("Looking up company in verified database..."):
             company_result = company_verifier.verify_company(company_name.strip(), enable_discovery)
 
         if not company_result["is_genuine"] or not company_result.get("careers_url"):
-            # ── RESULT: COMPANY NOT VERIFIABLE ──────────────────────
+            #                                                                              RESULT: COMPANY NOT VERIFIABLE                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
             st.markdown('<div class="discovery-failure">', unsafe_allow_html=True)
             st.markdown(
                 "<div style='font-size:2rem;font-weight:800;color:#991b1b;'>Company Cannot Be Verified</div>"
@@ -2119,13 +2216,13 @@ def main():
             )
             st.markdown('</div>', unsafe_allow_html=True)
             st.warning("Details: " + company_result['details'])
-            st.markdown("""
-**Safety Warning:**
-- This company is not in our verified database
-- No official career page was found even with AI auto-discovery
-- Do NOT apply or share personal information
-- Verify the company independently before proceeding
-            """)
+            st.markdown(
+                "**Safety Warning:**\n"
+                "- This company is not in our verified database\n"
+                "- No official career page was found even with AI auto-discovery\n"
+                "- Do NOT apply or share personal information\n"
+                "- Verify the company independently before proceeding"
+            )
             return
 
         # Company found
@@ -2138,13 +2235,90 @@ def main():
                 "via web scraping and added to the database."
             )
         else:
-            st.success("Company Verified: " + company_result['company_name'] + " — " + source_label)
+            st.success("Company Verified: " + company_result['company_name'] + "                                        " + source_label)
 
         st.info("Official Career Page: [" + careers_url + "](" + careers_url + ")")
 
-        # ──────────────────────────────────────────────────────────────
-        # STEP 3: SCRAPE CAREER PAGE — SEARCH FOR SPECIFIC JOB ROLE
-        # ──────────────────────────────────────────────────────────────
+        # Optional: verify using direct job URL (best for JS-heavy portals)
+        allowed_domains = []
+        try:
+            allowed_domains.append(urlparse(careers_url).netloc)
+        except Exception:
+            pass
+        if company_result.get("website"):
+            try:
+                allowed_domains.append(urlparse(company_result["website"]).netloc)
+            except Exception:
+                pass
+
+        # Update fraud score with company domain context (email/domain checks)
+        fraud_score, fraud_breakdown = scorer.score(
+            company_name.strip(),
+            job_title.strip(),
+            job_description.strip(),
+            allowed_domains
+        )
+        st.metric("Fraud Risk Score (with company domain)", str(fraud_score) + "/100")
+
+        # If user didn't paste a URL, try to auto-detect from description
+        if not (job_url and job_url.strip()):
+            auto_url = _extract_first_url(job_description)
+            if auto_url:
+                job_url = auto_url
+                st.info("Detected a job URL from the description. Using it for verification.")
+
+        # Accenture fallback: build job URL from job ID in description/title
+        if not (job_url and job_url.strip()) and company_result.get("company_name", "").lower() == "accenture":
+            acc_id = _extract_accenture_job_id(job_description + " " + job_title)
+            if acc_id:
+                job_url = "https://www.accenture.com/in-en/careers/jobdetails?id=" + acc_id
+                st.info("Detected Accenture job ID. Constructed job URL for verification.")
+
+        if job_url and job_url.strip():
+            with st.spinner("Verifying the specific job URL..."):
+                url_check = verify_job_url(job_url, job_title.strip(), allowed_domains)
+
+            if url_check["status"] == "verified":
+                st.markdown('<div class="genuine-card">', unsafe_allow_html=True)
+                st.markdown(
+                    "<div style='font-size:3rem;margin-bottom:0.5rem;'>&#10003;</div>"
+                    "<div style='font-size:2rem;font-weight:800;color:#065f46;'>GENUINE JOB OPENING</div>"
+                    "<div style='font-size:1.1rem;color:#064e3b;margin-top:0.5rem;'>"
+                    "The job URL matches the official domain and the role title was found on the page.</div>",
+                    unsafe_allow_html=True
+                )
+                st.markdown("**Job Posting URL**: [" + job_url.strip() + "](" + job_url.strip() + ")")
+                st.markdown("**Official Career Page**: [" + careers_url + "](" + careers_url + ")")
+                st.markdown('</div>', unsafe_allow_html=True)
+                return
+            elif url_check["status"] == "blocked":
+                st.warning("Job URL could not be verified: " + url_check["reason"])
+                # Continue with scraping as fallback
+            else:
+                st.info("Job URL check inconclusive: " + url_check["reason"])
+                # Continue with scraping as fallback
+
+        # Verification checklist (URL, ATS, email)
+        st.markdown("### Verification Checklist")
+        checklist = build_verification_checklist(
+            company_result,
+            job_url.strip() if job_url else "",
+            job_title.strip(),
+            job_description
+        )
+        for label, result in checklist:
+            status = result.get("status", "inconclusive")
+            reason = result.get("reason", "")
+            if status == "verified":
+                st.success(label + ": " + reason)
+            elif status == "blocked":
+                st.warning(label + ": " + reason)
+            else:
+                st.info(label + ": " + reason)
+
+        #                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+        # STEP 3: SCRAPE CAREER PAGE                                        SEARCH FOR SPECIFIC JOB ROLE
+        #                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
         st.markdown("---")
         st.markdown("### Searching for **'" + job_title.strip() + "'** on " + company_result['company_name'] + "'s Career Page...")
 
@@ -2155,68 +2329,105 @@ def main():
                 job_title.strip()
             )
 
-        if matching_jobs:
-            # ── RESULT: GENUINE JOB OPENING ─────────────────────────
+        scrape_ok = (job_scraper.last_fetch_ok and not job_scraper.last_dynamic_site and job_scraper.last_error is None)
+        verdict = compute_overall_verdict(
+            matching_jobs,
+            scrape_ok,
+            checklist,
+            fraud_score=fraud_score,
+            company_verified=True,
+            dynamic_site=job_scraper.last_dynamic_site
+        )
+
+        if verdict == "VERIFIED":
             st.markdown('<div class="genuine-card">', unsafe_allow_html=True)
             st.markdown(
                 "<div style='font-size:3rem;margin-bottom:0.5rem;'>&#10003;</div>"
-                "<div style='font-size:2rem;font-weight:800;color:#065f46;'>GENUINE JOB OPENING</div>"
+                "<div style='font-size:2rem;font-weight:800;color:#065f46;'>VERIFIED JOB OPENING</div>"
                 "<div style='font-size:1.1rem;color:#064e3b;margin-top:0.5rem;'>"
-                "<strong>" + company_result['company_name'] + "</strong> is actively hiring for "
-                "<strong>'" + job_title.strip() + "'</strong> or a closely matching role.</div>",
+                "<strong>" + company_result['company_name'] + "</strong> has a verified signal for "
+                "<strong>'" + job_title.strip() + "'</strong>.</div>",
                 unsafe_allow_html=True
             )
             st.markdown("**Apply Directly**: [" + careers_url + "](" + careers_url + ")")
             st.markdown('</div>', unsafe_allow_html=True)
 
-            st.markdown("#### " + str(len(matching_jobs)) + " Matching Opening(s) Found on Official Career Page")
-            for job in matching_jobs:
-                st.markdown(
-                    '<div class="job-listing">'
-                    '<div class="job-title">' + job["title"] + '</div>'
-                    '<div class="job-meta">Location: ' + job["location"] + ' | Type: ' + job["type"] + ' | Posted: ' + job.get("posted", "Current") + '</div>'
-                    '<a href="' + job['url'] + '" target="_blank" class="job-link">View Opening on Official Career Page</a>'
-                    '</div>',
-                    unsafe_allow_html=True
-                )
+            if matching_jobs:
+                st.markdown("#### " + str(len(matching_jobs)) + " Matching Opening(s) Found on Official Career Page")
+                for job in matching_jobs:
+                    st.markdown(
+                        '<div class="job-listing">'
+                        '<div class="job-title">' + job["title"] + '</div>'
+                        '<div class="job-meta">Location: ' + job["location"] + ' | Type: ' + job["type"] + ' | Posted: ' + job.get("posted", "Current") + '</div>'
+                        '<a href="' + job['url'] + '" target="_blank" class="job-link">View Opening on Official Career Page</a>'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
 
-            st.markdown("""
-**Professional Advice:**
-- These openings are scraped from the company's official career page
-- Always apply through the official career portal — never via WhatsApp or Telegram
-- A legitimate company will never ask for fees during hiring
-- Verify the recruiter's email domain matches the company's official domain
-            """)
+        elif verdict == "GENUINE_LIKELY":
+            st.markdown('<div class="discovery-failure">', unsafe_allow_html=True)
+            st.markdown(
+                "<div style='font-size:2rem;font-weight:800;color:#92400e;'>GENUINE LIKELY</div>"
+                "<div style='font-size:1.1rem;color:#7c2d12;margin-top:0.5rem;'>"
+                "The company is verified, but the career portal is JS-heavy and could not be scraped. "
+                "This role is likely genuine. Please verify directly on the official career page.</div>",
+                unsafe_allow_html=True
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown("**Verify on official career page**: [" + careers_url + "](" + careers_url + ")")
 
-        else:
-            # ── STEP 4: FAKE POSTING — company exists but NOT hiring for this role
+        elif verdict == "HIGH_RISK":
             st.markdown('<div class="fake-card">', unsafe_allow_html=True)
             st.markdown(
                 "<div style='font-size:3rem;margin-bottom:0.5rem;'>&#10060;</div>"
-                "<div style='font-size:2rem;font-weight:800;color:#991b1b;'>FAKE JOB POSTING</div>"
+                "<div style='font-size:2rem;font-weight:800;color:#991b1b;'>HIGH RISK / UNVERIFIED</div>"
                 "<div style='font-size:1.1rem;color:#7f1d1d;margin-top:0.5rem;'>"
-                "<strong>" + company_result['company_name'] + "</strong> is a verified real company, "
-                "but they are <strong>NOT currently hiring</strong> for "
-                "<strong>'" + job_title.strip() + "'</strong> on their official career page. "
-                "This posting is likely <strong>fraudulent</strong>.</div>",
+                "One or more strong warning signals were detected (e.g., non-official domain or email).</div>",
                 unsafe_allow_html=True
             )
             st.markdown("**Verify on official career page**: [" + careers_url + "](" + careers_url + ")")
             st.markdown('</div>', unsafe_allow_html=True)
 
-            st.error(
-                "Why This Is Marked as Fake:\n\n"
-                "- The company **" + company_result['company_name'] + "** is real with a verified career page\n"
-                "- No current opening for **'" + job_title.strip() + "'** was found on their official page\n"
-                "- Fraudsters commonly impersonate real companies to make fake postings look credible"
+        elif verdict == "INCONCLUSIVE":
+            st.markdown('<div class="discovery-failure">', unsafe_allow_html=True)
+            st.markdown(
+                "<div style='font-size:2rem;font-weight:800;color:#991b1b;'>INCONCLUSIVE</div>"
+                "<div style='font-size:1.1rem;color:#7f1d1d;margin-top:0.5rem;'>"
+                "We could not verify this role automatically. This does <strong>not</strong> mean it is fake."
+                "</div>",
+                unsafe_allow_html=True
             )
-            st.markdown("""
-**What You Should Do:**
-- Visit the official career page link above to check directly
-- Do NOT apply through the source that shared this posting with you
-- Do NOT share personal or financial details with the recruiter
-- Contact the company's HR only through their official website
-            """)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown("**Verify on official career page**: [" + careers_url + "](" + careers_url + ")")
+
+            if job_scraper.last_dynamic_site:
+                st.warning("This career portal appears to be JavaScript-heavy, so server-side scraping may miss listings.")
+            if job_scraper.last_error:
+                st.warning("Scrape error: " + job_scraper.last_error)
+            if job_scraper.last_status_code:
+                st.caption("HTTP status: " + str(job_scraper.last_status_code))
+
+        else:
+            st.markdown('<div class="fake-card">', unsafe_allow_html=True)
+            st.markdown(
+                "<div style='font-size:3rem;margin-bottom:0.5rem;'>&#10060;</div>"
+                "<div style='font-size:2rem;font-weight:800;color:#991b1b;'>UNVERIFIED ROLE</div>"
+                "<div style='font-size:1.1rem;color:#7f1d1d;margin-top:0.5rem;'>"
+                "We could not find this role on the official career page. This does not confirm it is fake."
+                "</div>",
+                unsafe_allow_html=True
+            )
+            st.markdown("**Verify on official career page**: [" + careers_url + "](" + careers_url + ")")
+            st.markdown('</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
