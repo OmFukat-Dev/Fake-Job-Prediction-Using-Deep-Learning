@@ -1,0 +1,105 @@
+1. Project Overview
+This project detects fraudulent job postings using a deep learning LSTM model and provides a Streamlit web app to verify job listings and assess fraud risk. It can also scrape official career pages to help validate jobs.
+
+2. Prerequisites
+- Python 3.x (must be compatible with TensorFlow 2.8+)
+- pip (Python package manager)
+- Git (to clone the repository)
+- Internet connection (needed for NLTK data download and optional job scraping)
+
+3. Installation Steps
+1. Clone the repository:
+```bash
+git clone <repository-url>
+```
+2. Go to the project folder:
+```bash
+cd <project-folder>
+```
+3. Create a virtual environment:
+```bash
+python -m venv .venv
+```
+4. Activate the virtual environment:
+```bash
+# Windows
+.venv\Scripts\activate
+
+# macOS/Linux
+source .venv/bin/activate
+```
+5. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+6. Ensure the dataset is in place:
+```text
+data/raw/fake_job_postings.csv
+```
+If this file is missing, download the “Fake Job Postings” dataset from Kaggle and place it at the path above.
+
+4. How to Run the Project
+1. Prepare the data (cleans and splits the dataset):
+```bash
+python scripts/run_data_cleaning.py
+```
+2. Train the model (creates the model and tokenizer files):
+```bash
+python scripts/train_model.py
+```
+This creates:
+```text
+models/lstm_text_model.h5
+models/tokenizer.pkl
+models/model_performance.txt
+```
+3. Run the Streamlit app:
+```bash
+streamlit run app.py
+```
+Open the app in your browser at:
+```text
+http://127.0.0.1:8501
+```
+Optional Windows shortcut:
+```text
+run_app.bat
+```
+This script checks for required files, runs data cleaning and tokenizer creation if missing, then starts the app.
+
+5. Configuration Details
+The main configuration file is:
+```text
+config.yaml
+```
+You can edit it to change:
+```text
+- Dataset paths
+- Train/validation/test split sizes
+- Model hyperparameters (sequence length, units, epochs, etc.)
+- Output paths
+```
+
+6. Database Setup (if applicable)
+No database setup is required. The app uses in-memory data structures and local files. A file named `companies.db` exists in the repository but is not referenced by the code.
+
+7. Environment Variables
+No required environment variables are defined in this project.
+
+8. Troubleshooting
+1. “Dataset file not found” error:
+   Ensure `data/raw/fake_job_postings.csv` exists.
+2. “Model or tokenizer not found” in the app:
+   Run `python scripts/run_data_cleaning.py` and `python scripts/train_model.py`.
+3. NLTK download errors:
+   Make sure you have internet access, then re-run the preprocessing step.
+4. “streamlit not found”:
+   Activate the virtual environment and re-run `pip install -r requirements.txt`.
+5. TensorFlow installation issues:
+   Verify your Python version is compatible with TensorFlow 2.8+.
+6. App not reachable at 127.0.0.1:8501:
+   Check if another process is using port 8501, or restart Streamlit.
+
+9. Additional Notes
+- The app performs web scraping of public career pages. Some sites may block requests or require JavaScript, which can make scraping inconclusive.
+- Training can be slow on CPU; using a GPU-enabled TensorFlow installation can speed it up.
